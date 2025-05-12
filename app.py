@@ -169,7 +169,7 @@ def create_date_picker(action_label="日付を選択", postback_data="select_dat
     )
 
 def create_time_selection_quick_reply(base_datetime=None):
-    """30分単位の時間選択肢をQuickReplyで返す（当日分 or 指定日）"""
+    """30分単位の時間選択肢をQuickReplyで返す（当日分のみ表示）"""
     items = []
     if not base_datetime:
         base_datetime = datetime.now()
@@ -198,7 +198,10 @@ def create_time_selection_quick_reply(base_datetime=None):
             )
         current += timedelta(minutes=RESERVATION_INTERVAL_MINUTES)
 
-    return QuickReply(items=items)
+    if items: # QuickReplyのアイテムが一つ以上ある場合のみQuickReplyオブジェクトを作成
+        return QuickReply(items=items)
+    else:
+        return None # 選択肢がない場合はNoneを返す
 
 # --- 4. Webhookルートとイベントハンドラ ---
 @app.route("/callback", methods=['POST'])
@@ -229,10 +232,14 @@ def handle_text_message(event):
 
     if text.lower() == "予約":
         set_user_state(user_id, "ASKING_TIME", {})
-        messages_to_reply.append(TextMessage(
-            text="ご希望の時間帯を選択してください（本日分のみ表示）",
-            quick_reply=create_time_selection_quick_reply()
-        ))
+        time_reply = create_time_selection_quick_reply()
+        if time_reply:
+            messages_to_reply.append(TextMessage(
+                text="ご希望の時間帯を選択してください（本日分のみ表示）",
+                quick_reply=time_reply
+            ))
+        else:
+            messages_to_reply.append(TextMessage(text="申し訳ありません。本日ご予約可能な時間帯はございません。"))
 
     elif current_state == "ASKING_PEOPLE":
         try:
