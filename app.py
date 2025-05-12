@@ -8,10 +8,12 @@ from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage, TemplateMessage,
     ConfirmTemplate, PostbackAction, DatetimePickerAction,
-    QuickReply, QuickReplyItem
+    QuickReply, QuickReplyItem, RichMenu, RichMenuArea,
+    RichMenuBounds, MessageAction
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, PostbackEvent
 from dotenv import load_dotenv # python-dotenvをインストールしてください (pip install python-dotenv)
+import json
 
 # .envファイルから環境変数を読み込む (開発時便利)
 load_dotenv()
@@ -77,15 +79,13 @@ def get_user_state(user_id):
         cursor.execute("SELECT state, data FROM user_states WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         if row:
-            import json
             return {"state": row["state"], "data": json.loads(row["data"]) if row["data"] else {}}
         return None
 
 def set_user_state(user_id, state, data=None):
-    import json
+    current_data_json = json.dumps(data if data is not None else {})
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        current_data_json = json.dumps(data if data is not None else {})
         cursor.execute('''
             INSERT INTO user_states (user_id, state, data) VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, data = excluded.data
@@ -117,22 +117,19 @@ def create_reservation(user_id, reservation_datetime_obj, num_people):
 
 def count_reservations_for_datetime(reservation_datetime_obj):
     """指定された日時の予約数をカウント"""
-    # 予約時間帯の開始と終了を定義 (例: 予約日時の前後30分など、店舗の運用に合わせる)
-    # ここでは簡単のため、同一時刻のみをチェック
     reservation_datetime_iso_exact = reservation_datetime_obj.isoformat()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT COUNT(*) FROM reservations
-            WHERE reservation_datetime = ? AND status = 'confirmed'
-        ''', (reservation_datetime_iso_exact,))
+            WHERE reservation_datetime LIKE ? AND status = 'confirmed'
+        ''', (f"{reservation_datetime_iso_exact.split('T')[0]}%",)) # 同日の予約をカウント
         count = cursor.fetchone()[0]
         return count
 
 def is_store_open(reservation_datetime_obj):
     """指定された日時が営業時間内か判定"""
     reservation_time = reservation_datetime_obj.time()
-    # 注意: 日付をまたぐ営業時間は別途考慮が必要
     return STORE_OPEN_TIME <= reservation_time < STORE_CLOSE_TIME
 
 def is_valid_reservation_minute(reservation_datetime_obj):
@@ -143,7 +140,7 @@ def is_valid_reservation_minute(reservation_datetime_obj):
 # --- 3. LINE メッセージテンプレート作成ヘルパー ---
 def create_confirm_template(text, yes_label, yes_data, no_label, no_data):
     return TemplateMessage(
-        alt_text=text.split('\n')[0], # 最初の行を代替テキストに
+        alt_text=text.split('\n')[0],
         template=ConfirmTemplate(
             text=text,
             actions=[
@@ -153,12 +150,55 @@ def create_confirm_template(text, yes_label, yes_data, no_label, no_data):
         )
     )
 
-def create_datetime_picker(action_label="日時を選択", postback_data="select_datetime"):
+def create_date_picker(action_label="日付を選択", postback_data="select_date"):
+    now = datetime.now()
+    min_date = now.strftime('%Y-%m-%d')
+    max_date = (now + timedelta(days=7)).strftime('%Y-%m-%d') # 例: 1週間後まで
+
     return QuickReply(
         items=[
-            QuickReplyItem(action=DatetimePickerAction(label=action_label, data=postback_data, mode="datetime"))
+            QuickReplyItem(action=DatetimePickerAction(
+                label=action_label,
+                data=postback_data,
+                mode="date",
+                initial=min_date,
+                min=min_date,
+                max=max_date
+            ))
         ]
     )
+
+def create_time_selection_quick_reply(base_datetime=None):
+    """30分単位の時間選択肢をQuickReplyで返す（当日分 or 指定日）"""
+    items = []
+    if not base_datetime:
+        base_datetime = datetime.now()
+
+    # 当日 or 翌日の日付（時間が遅ければ翌日に切り替えも可）
+    date = base_datetime.date()
+    now = datetime.now()
+
+    # 時間範囲
+    current = datetime.combine(date, STORE_OPEN_TIME)
+    end = datetime.combine(date, STORE_CLOSE_TIME)
+
+    while current < end:
+        # 今より30分以上先の時間のみ表示（当日の場合）
+        if current > now + timedelta(minutes=30):
+            label = current.strftime("%H:%M")
+            iso_str = current.isoformat()
+            items.append(
+                QuickReplyItem(
+                    action=PostbackAction(
+                        label=label,
+                        data=f"select_time|{iso_str}",
+                        display_text=label
+                    )
+                )
+            )
+        current += timedelta(minutes=RESERVATION_INTERVAL_MINUTES)
+
+    return QuickReply(items=items)
 
 # --- 4. Webhookルートとイベントハンドラ ---
 @app.route("/callback", methods=['POST'])
@@ -187,14 +227,17 @@ def handle_text_message(event):
     current_state = user_state_info["state"] if user_state_info else None
     user_data = user_state_info["data"] if user_state_info and user_state_info.get("data") else {}
 
-
     if text.lower() == "予約":
-        set_user_state(user_id, "ASKING_DATETIME", {})
-        messages_to_reply.append(TextMessage(text="ご予約ですね。ご希望の日時を選択してください。", quick_reply=create_datetime_picker()))
+        set_user_state(user_id, "ASKING_TIME", {})
+        messages_to_reply.append(TextMessage(
+            text="ご希望の時間帯を選択してください（本日分のみ表示）",
+            quick_reply=create_time_selection_quick_reply()
+        ))
+
     elif current_state == "ASKING_PEOPLE":
         try:
             num_people = int(text)
-            if not (1 <= num_people <= 10): # 例: 1名から10名まで
+            if not (1 <= num_people <= 10):
                 raise ValueError("人数は1名から10名の間で入力してください。")
 
             user_data["people"] = num_people
@@ -205,7 +248,6 @@ def handle_text_message(event):
             if dt_obj_str:
                 dt_obj = datetime.fromisoformat(dt_obj_str)
                 dt_display_str = dt_obj.strftime('%Y年%m月%d日 %H時%M分')
-
 
             confirm_text = (
                 f"以下の内容で予約しますか？\n"
@@ -218,8 +260,6 @@ def handle_text_message(event):
         except Exception as e:
             app.logger.error(f"Error in ASKING_PEOPLE state: {e}")
             messages_to_reply.append(TextMessage(text="エラーが発生しました。もう一度お試しください。"))
-            delete_user_state(user_id) # エラー時は状態をリセット
-    # ... 他の状態やコマンドに対する処理 ...
     else:
         messages_to_reply.append(TextMessage(text=f"「{text}」ですね。\n「予約」と入力すると予約を開始できます。"))
 
@@ -239,45 +279,38 @@ def handle_postback(event):
     user_id = event.source.user_id
     reply_token = event.reply_token
     postback_data = event.postback.data
+    
     messages_to_reply = []
 
     user_state_info = get_user_state(user_id)
     current_state = user_state_info["state"] if user_state_info else None
     user_data = user_state_info["data"] if user_state_info and user_state_info.get("data") else {}
 
-    if postback_data == "select_datetime":
-        if current_state != "ASKING_DATETIME":
-            # 予期せぬタイミングでの日時選択
+    if postback_data.startswith("select_time|"):
+        if current_state != "ASKING_TIME":
             messages_to_reply.append(TextMessage(text="予期せぬ操作です。最初から「予約」と入力してください。"))
             delete_user_state(user_id)
         else:
-            selected_datetime_str = event.postback.params.get('datetime')
-            if selected_datetime_str:
-                try:
-                    selected_dt = datetime.strptime(selected_datetime_str, '%Y-%m-%dT%H:%M')
+            try:
+                iso_str = postback_data.split("|")[1]
+                selected_dt = datetime.fromisoformat(iso_str)
 
-                    if selected_dt < datetime.now() + timedelta(minutes=30): # 30分後以降の予約のみ
-                        messages_to_reply.append(TextMessage(text="過去の日時、または直近すぎる時間は指定できません。30分後以降でお願いします。"))
-                    elif not is_store_open(selected_dt):
-                        messages_to_reply.append(TextMessage(text=f"申し訳ありません。その時間は営業時間外です。\n(営業時間: {STORE_OPEN_TIME.strftime('%H:%M')}～{STORE_CLOSE_TIME.strftime('%H:%M')})"))
-                    elif not is_valid_reservation_minute(selected_dt):
-                        messages_to_reply.append(TextMessage(text=f"申し訳ありません。ご予約は{RESERVATION_INTERVAL_MINUTES}分単位で承っております。(例: 10:00, 10:30)"))
-                    else:
-                        # 空き状況チェック
-                        num_existing_reservations = count_reservations_for_datetime(selected_dt)
-                        if num_existing_reservations >= MAX_RESERVATIONS_PER_SLOT:
-                            messages_to_reply.append(TextMessage(text="申し訳ありません。その時間帯は既に満席です。別の日時をお試しください。"))
-                        else:
-                            user_data["datetime_obj_iso"] = selected_dt.isoformat() # ISO形式で保存
-                            set_user_state(user_id, "ASKING_PEOPLE", user_data)
-                            dt_display_str = selected_dt.strftime('%Y年%m月%d日 %H時%M分')
-                            messages_to_reply.append(TextMessage(text=f"{dt_display_str}ですね。次に、ご希望の人数を半角数字で入力してください。(例: 2)"))
+                # 空きチェック
+                if count_reservations_for_datetime(selected_dt) >= MAX_RESERVATIONS_PER_SLOT:
+                    messages_to_reply.append(TextMessage(text="申し訳ありません。その時間帯は満席です。別の時間をお選びください。"))
+                    messages_to_reply.append(TextMessage(
+                        text="再度、時間帯をお選びください。",
+                        quick_reply=create_time_selection_quick_reply()
+                    ))
+                else:
+                    user_data["datetime_obj_iso"] = selected_dt.isoformat()
+                    set_user_state(user_id, "ASKING_PEOPLE", user_data)
+                    time_display = selected_dt.strftime('%H:%M')
+                    messages_to_reply.append(TextMessage(text=f"{time_display}ですね。次に、人数（1〜10）を入力してください。"))
+            except Exception as e:
+                app.logger.error(f"時間選択の処理エラー: {e}")
+                messages_to_reply.append(TextMessage(text="時間形式の処理中にエラーが発生しました。もう一度お試しください。"))
 
-                except ValueError:
-                    messages_to_reply.append(TextMessage(text="日時の形式が正しくありません。もう一度選択してください。"))
-                except Exception as e:
-                    app.logger.error(f"Error processing datetime selection: {e}")
-                    messages_to_reply.append(TextMessage(text="日時の処理中にエラーが発生しました。"))
             else:
                 messages_to_reply.append(TextMessage(text="日時が選択されませんでした。"))
 
